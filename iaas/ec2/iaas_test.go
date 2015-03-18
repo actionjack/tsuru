@@ -5,16 +5,19 @@
 package ec2
 
 import (
+	"bytes"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"testing"
 
+	"github.com/awslabs/aws-sdk-go/aws"
+	"github.com/awslabs/aws-sdk-go/gen/ec2"
+	"github.com/awslabs/aws-sdk-go/gen/endpoints"
 	"github.com/tsuru/config"
 	"github.com/tsuru/tsuru/iaas"
-	"gopkg.in/amz.v2/aws"
-	"gopkg.in/amz.v2/ec2"
+	ec2amz "gopkg.in/amz.v2/ec2"
 	"gopkg.in/amz.v2/ec2/ec2test"
 	"gopkg.in/check.v1"
 )
@@ -23,7 +26,7 @@ func Test(t *testing.T) { check.TestingT(t) }
 
 type S struct {
 	srv    *ec2test.Server
-	region aws.Region
+	region string
 }
 
 var _ = check.Suite(&S{})
@@ -32,12 +35,8 @@ func (s *S) SetUpTest(c *check.C) {
 	var err error
 	s.srv, err = ec2test.NewServer()
 	c.Assert(err, check.IsNil)
-	s.region = aws.Region{
-		Name:        "myregion",
-		EC2Endpoint: s.srv.URL(),
-		Sign:        aws.SignV2,
-	}
-	aws.Regions["myregion"] = s.region
+	s.region = "myregion"
+	endpoints.AddOverride("ec2", s.region, s.srv.URL())
 	config.Set("iaas:ec2:key-id", "mykey")
 	config.Set("iaas:ec2:secret-key", "mysecret")
 }
@@ -46,26 +45,17 @@ func (s *S) TearDownTest(c *check.C) {
 	s.srv.Quit()
 }
 
-func (s *S) TestCreateEC2Handler(c *check.C) {
-	ec2iaas := NewEC2IaaS()
-	handler, err := ec2iaas.createEC2Handler(aws.APNortheast)
-	c.Assert(err, check.IsNil)
-	c.Assert(handler.Region.EC2Endpoint, check.DeepEquals, aws.APNortheast.EC2Endpoint)
-	c.Assert(handler.Auth.AccessKey, check.Equals, "mykey")
-	c.Assert(handler.Auth.SecretKey, check.Equals, "mysecret")
-}
-
 func (s *S) TestCreateMachine(c *check.C) {
 	params := map[string]string{
-		"region": "myregion",
+		"region": s.region,
 		"image":  "ami-xxxxxx",
 		"type":   "m1.micro",
 	}
 	ec2iaas := NewEC2IaaS()
 	m, err := ec2iaas.CreateMachine(params)
-	m.CreationParams = map[string]string{"region": "myregion"}
-	defer ec2iaas.DeleteMachine(m)
 	c.Assert(err, check.IsNil)
+	m.CreationParams = map[string]string{"region": s.region}
+	defer ec2iaas.DeleteMachine(m)
 	c.Assert(m.Id, check.Matches, `i-\d`)
 	c.Assert(m.Address, check.Matches, `i-\d.testing.invalid`)
 	c.Assert(m.Status, check.Equals, "pending")
@@ -76,7 +66,7 @@ func (s *S) TestCreateMachineTimeoutError(c *check.C) {
 	defer config.Unset("iaas:ec2:wait-timeout")
 	var calledActions []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		action := r.URL.Query().Get("Action")
+		action := r.FormValue("Action")
 		calledActions = append(calledActions, action)
 		if action == "DescribeInstances" {
 			w.Write([]byte(`
@@ -95,8 +85,14 @@ func (s *S) TestCreateMachineTimeoutError(c *check.C) {
 </DescribeInstancesResponse>`))
 			return
 		}
-		req, err := http.NewRequest(r.Method, s.srv.URL()+r.RequestURI, r.Body)
+		buf := bytes.NewBufferString(r.Form.Encode())
+		req, err := http.NewRequest(r.Method, s.srv.URL()+r.RequestURI, buf)
 		c.Assert(err, check.IsNil)
+		for name, values := range r.Header {
+			for _, value := range values {
+				req.Header.Add(name, value)
+			}
+		}
 		rsp, err := http.DefaultClient.Do(req)
 		c.Assert(err, check.IsNil)
 		w.WriteHeader(rsp.StatusCode)
@@ -108,12 +104,7 @@ func (s *S) TestCreateMachineTimeoutError(c *check.C) {
 		c.Assert(err, check.IsNil)
 		w.Write(bytes)
 	}))
-	timeoutRegion := aws.Region{
-		Name:        "timeoutregion",
-		EC2Endpoint: server.URL,
-		Sign:        aws.SignV2,
-	}
-	aws.Regions["timeoutregion"] = timeoutRegion
+	endpoints.AddOverride("ec2", "timeoutregion", server.URL)
 	params := map[string]string{
 		"region": "timeoutregion",
 		"image":  "ami-xxxxxx",
@@ -128,12 +119,7 @@ func (s *S) TestCreateMachineTimeoutError(c *check.C) {
 func (s *S) TestCreateMachineDefaultRegion(c *check.C) {
 	defaultRegionServer, err := ec2test.NewServer()
 	c.Assert(err, check.IsNil)
-	region := aws.Region{
-		Name:        defaultRegion,
-		EC2Endpoint: defaultRegionServer.URL(),
-		Sign:        aws.SignV2,
-	}
-	aws.Regions[defaultRegion] = region
+	endpoints.AddOverride("ec2", defaultRegion, defaultRegionServer.URL())
 	params := map[string]string{
 		"image": "ami-xxxxxx",
 		"type":  "m1.micro",
@@ -158,28 +144,24 @@ func (s *S) TestWaitForDnsName(c *check.C) {
 	ec2iaas := NewEC2IaaS()
 	handler, err := ec2iaas.createEC2Handler(s.region)
 	c.Assert(err, check.IsNil)
-	options := ec2.RunInstances{
-		ImageId:      "ami-xxx",
-		InstanceType: "m1.small",
-		MinCount:     1,
-		MaxCount:     1,
+	options := ec2.RunInstancesRequest{
+		ImageID:      aws.String("ami-xxx"),
+		InstanceType: aws.String("m1.small"),
+		MinCount:     aws.Integer(1),
+		MaxCount:     aws.Integer(1),
 	}
 	resp, err := handler.RunInstances(&options)
 	c.Assert(err, check.IsNil)
 	instance := &resp.Instances[0]
-	instance.DNSName = ""
+	instance.PublicDNSName = nil
 	instance, err = ec2iaas.waitForDnsName(handler, instance)
 	c.Assert(err, check.IsNil)
-	c.Assert(instance.DNSName, check.Matches, `i-\d.testing.invalid`)
+	c.Assert(*instance.PublicDNSName, check.Matches, `i-\d.testing.invalid`)
 }
 
 func (s *S) TestCreateMachineValidations(c *check.C) {
 	ec2iaas := NewEC2IaaS()
 	_, err := ec2iaas.CreateMachine(map[string]string{
-		"region": "invalid-region",
-	})
-	c.Assert(err, check.ErrorMatches, `region "invalid-region" not found`)
-	_, err = ec2iaas.CreateMachine(map[string]string{
 		"region": "myregion",
 	})
 	c.Assert(err, check.ErrorMatches, "image param required")
@@ -191,7 +173,7 @@ func (s *S) TestCreateMachineValidations(c *check.C) {
 }
 
 func (s *S) TestDeleteMachine(c *check.C) {
-	insts := s.srv.NewInstances(1, "m1.small", "ami-x", ec2.InstanceState{}, nil)
+	insts := s.srv.NewInstances(1, "m1.small", "ami-x", ec2amz.InstanceState{}, nil)
 	m := iaas.Machine{
 		Id:             insts[0],
 		CreationParams: map[string]string{"region": "myregion"},
@@ -202,19 +184,13 @@ func (s *S) TestDeleteMachine(c *check.C) {
 }
 
 func (s *S) TestDeleteMachineValidations(c *check.C) {
-	insts := s.srv.NewInstances(1, "m1.small", "ami-x", ec2.InstanceState{}, nil)
+	insts := s.srv.NewInstances(1, "m1.small", "ami-x", ec2amz.InstanceState{}, nil)
 	ec2iaas := NewEC2IaaS()
 	m := &iaas.Machine{
 		Id:             insts[0],
-		CreationParams: map[string]string{"region": "invalid"},
-	}
-	err := ec2iaas.DeleteMachine(m)
-	c.Assert(err, check.ErrorMatches, `region "invalid" not found`)
-	m = &iaas.Machine{
-		Id:             insts[0],
 		CreationParams: map[string]string{},
 	}
-	err = ec2iaas.DeleteMachine(m)
+	err := ec2iaas.DeleteMachine(m)
 	c.Assert(err, check.ErrorMatches, `region creation param required`)
 }
 
